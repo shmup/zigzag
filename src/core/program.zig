@@ -56,7 +56,8 @@ pub fn Program(comptime Model: type) type {
         pending_tick: ?u64,
         every_interval: ?u64,
         last_every_tick: u64,
-        last_view_hash: u64,
+        // Per-line hashes for diffing; items.len == last_line_count after each render.
+        last_line_hashes: std.ArrayList(u64),
         last_line_count: usize,
         pending_image: ?PendingImage,
         logger: ?Logger,
@@ -92,7 +93,7 @@ pub fn Program(comptime Model: type) type {
                 .pending_tick = null,
                 .every_interval = null,
                 .last_every_tick = 0,
-                .last_view_hash = 0,
+                .last_line_hashes = .empty,
                 .last_line_count = 0,
                 .pending_image = null,
                 .logger = null,
@@ -110,6 +111,7 @@ pub fn Program(comptime Model: type) type {
             if (self.logger) |*l| {
                 l.deinit();
             }
+            self.last_line_hashes.deinit(self.allocator);
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -235,6 +237,8 @@ pub fn Program(comptime Model: type) type {
                 const size = try self.terminal.?.getSize();
                 self.context.width = size.cols;
                 self.context.height = size.rows;
+                self.last_line_hashes.clearRetainingCapacity();
+                self.last_line_count = 0;
 
                 // Only send window_size message if the user model supports it
                 if (@hasField(UserMsg, "window_size")) {
@@ -405,7 +409,8 @@ pub fn Program(comptime Model: type) type {
             self.last_frame_time = self.clock.read();
 
             // Force re-render
-            self.last_view_hash = 0;
+            self.last_line_hashes.clearRetainingCapacity();
+            self.last_line_count = 0;
 
             // Dispatch resumed message if model supports it
             if (@hasField(UserMsg, "resumed")) {
@@ -678,48 +683,58 @@ pub fn Program(comptime Model: type) type {
         fn render(self: *Self) !void {
             const view_output = self.model.view(&self.context);
 
-            // Compute hash of view output
-            const view_hash = std.hash.Wyhash.hash(0, view_output);
+            var lines = std.mem.splitScalar(u8, view_output, '\n');
+            var line_idx: usize = 0;
+            var any_changed = false;
 
-            // Only redraw if view changed
-            if (view_hash != self.last_view_hash) {
-                const writer = self.terminal.?.writer();
+            const writer = self.terminal.?.writer();
 
-                // Start synchronized output (prevents tearing on supporting terminals)
-                try writer.writeAll(ansi.sync_start);
+            while (lines.next()) |line| {
+                const hash = std.hash.Wyhash.hash(line_idx, line);
+                const prev_hash: ?u64 = if (line_idx < self.last_line_hashes.items.len)
+                    self.last_line_hashes.items[line_idx]
+                else
+                    null;
 
-                // Move cursor home (don't clear entire screen to reduce flicker)
-                try writer.writeAll(ansi.cursor_home);
-
-                // Write each line, clearing to end of line
-                var lines = std.mem.splitScalar(u8, view_output, '\n');
-                var first = true;
-                var line_count: usize = 0;
-                while (lines.next()) |line| {
-                    if (!first) try writer.writeAll("\r\n");
-                    first = false;
+                if (prev_hash == null or prev_hash.? != hash) {
+                    if (!any_changed) {
+                        try writer.writeAll(ansi.sync_start);
+                        any_changed = true;
+                    }
+                    // position cursor to this line (0-indexed row, column 0)
+                    try ansi.cursorTo0(writer, @intCast(line_idx), 0);
                     try writer.writeAll(line);
                     try writer.writeAll(ansi.line_clear_right);
-                    line_count += 1;
-                }
 
-                // Clear remaining lines if previous content was taller
-                if (self.last_line_count > line_count) {
-                    var remaining = self.last_line_count - line_count;
-                    while (remaining > 0) : (remaining -= 1) {
-                        try writer.writeAll("\r\n");
-                        try writer.writeAll(ansi.line_clear);
+                    // update stored hash
+                    if (line_idx < self.last_line_hashes.items.len) {
+                        self.last_line_hashes.items[line_idx] = hash;
+                    } else {
+                        try self.last_line_hashes.append(self.allocator, hash);
                     }
                 }
-                self.last_line_count = line_count;
 
-                // End synchronized output
+                line_idx += 1;
+            }
+
+            // clear remaining lines if previous content was taller
+            if (self.last_line_count > line_idx) {
+                if (!any_changed) {
+                    try writer.writeAll(ansi.sync_start);
+                    any_changed = true;
+                }
+                var row = line_idx;
+                while (row < self.last_line_count) : (row += 1) {
+                    try ansi.cursorTo0(writer, @intCast(row), 0);
+                    try writer.writeAll(ansi.line_clear);
+                }
+                self.last_line_hashes.shrinkRetainingCapacity(line_idx);
+            }
+            self.last_line_count = line_idx;
+
+            if (any_changed) {
                 try writer.writeAll(ansi.sync_end);
-
                 try self.terminal.?.flush();
-
-                // Save hash for comparison
-                self.last_view_hash = view_hash;
             }
         }
 
